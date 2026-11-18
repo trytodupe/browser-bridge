@@ -1,12 +1,13 @@
 {
   "name": "browser-bridge",
-  "version": "1.0.0",
-  "description": "Browser addon that lets opencode read and interact with web pages",
+  "version": "2.0.1",
+  "description": "Zero-footprint on-demand Firefox bridge for coding agents",
   "scripts": {
-    "build": "web-ext build --source-dir addon --overwrite-dest",
+    "lint": "web-ext lint --source-dir addon",
+    "build": "web-ext build --source-dir addon --artifacts-dir dist --overwrite-dest",
+    "sign": "./scripts/sign-xpi.sh",
     "dev": "web-ext run --source-dir addon --firefox=firefox",
-    "reload-host": "pkill -f 'host/host.js' 2>/dev/null; sleep 0.5; node host/host.js &",
-    "lint": "web-ext lint --source-dir addon"
+    "test": "node --test tests/mcp-server.test.js"
   },
   "devDependencies": {
     "web-ext": "^8.0.0"

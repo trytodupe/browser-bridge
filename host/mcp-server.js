@@ -1,303 +1,278 @@
 #!/usr/bin/env node
+"use strict";
+
 const net = require("net");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 
 const SOCK = process.env.BRIDGE_SOCK || "/tmp/browser-bridge.sock";
+const SCREENSHOT_DIR = process.env.BRIDGE_SCREENSHOT_DIR || path.join(os.tmpdir(), "browser-bridge-screenshots");
+const MAX_SCREENSHOT_FILES = 30;
 
 let sock = null;
+let sockConnected = false;
 let buf = "";
-let pending = {};
+const pending = new Map();
 let nextId = 1;
 
+function failAllPending(reason) {
+  for (const [, entry] of pending) {
+    clearTimeout(entry.timer);
+    entry.onSocketClose(reason);
+  }
+  pending.clear();
+}
+
 function connect() {
-  sock = net.createConnection(SOCK);
-  sock.on("data", c => {
-    buf += c;
+  if (sock) return;
+  sockConnected = false;
+  const s = net.createConnection(SOCK);
+  sock = s;
+
+  s.on("connect", () => {
+    sockConnected = true;
+  });
+
+  s.on("data", chunk => {
+    buf += chunk;
     const lines = buf.split("\n");
     buf = lines.pop();
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
         const msg = JSON.parse(line);
-        if (msg._id && pending[msg._id]) {
-          pending[msg._id](msg);
-          delete pending[msg._id];
+        if (msg._id != null && pending.has(msg._id)) {
+          const entry = pending.get(msg._id);
+          pending.delete(msg._id);
+          clearTimeout(entry.timer);
+          entry.resolve(msg);
         }
-      } catch (e) {}
+      } catch (_) {}
     }
   });
-  sock.on("error", () => {});
-  sock.on("close", () => {
-    // A lost connection means pending requests will never be answered on
-    // this socket; fail them now so send() retries on a fresh one instead
-    // of waiting out the full timeout.
-    sock = null;
-    const waiting = Object.keys(pending);
-    for (const id of waiting) {
-      pending[id](null);
-      delete pending[id];
+
+  s.on("error", () => {});
+
+  s.on("close", () => {
+    if (sock === s) {
+      sock = null;
+      sockConnected = false;
     }
+    failAllPending("Unix socket closed (is Firefox running with browser-bridge enabled?)");
   });
 }
 
-const SEND_TIMEOUT = 8000;
-// navigate waits for tab load + content-script ready inside the addon.
-// navigate resolves on the first onUpdated status:"complete" (event-driven
-// since the addon speedup); slow sites burn the addon 10s fallback, so the
-// MCP window must exceed that or the retry double-fires.
-const NAVIGATE_TIMEOUT = 15000;
-const SEND_RETRIES = 2;
-// Mutating actions whose response may be lost when the page handles the click
-// but the socket/connection dies before the reply arrives. For these, a
-// timeout is reported as a non-fatal warning: the action may have landed.
-const MUTATING_CMDS = new Set(["click", "type", "act", "clear_storage"]);
-
-function send(msg) {
+// Send a command over the Unix socket to host.js -> Firefox addon.
+// Never retries after a timeout (prevents duplicate execution of batch JS/fetch).
+// Only retries once if a previously idle socket had silently closed right as we wrote.
+function send(msg, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-    // send with reconnect + retry: a stalled/dead socket is the usual cause of
-    // a "timeout" that the page actually handled fine. Drop the socket so the
-    // next attempt reconnects instead of silently dropping the response.
-    const attempt = (tryNo) => {
+    const attempt = allowReconnectRetry => {
+      const wasAlreadyOpen = Boolean(sock && sockConnected);
       if (!sock) connect();
       const id = nextId++;
-      const window = msg.cmd === "navigate" ? NAVIGATE_TIMEOUT : SEND_TIMEOUT;
+      const sentAt = Date.now();
+      const wireMsg = Object.assign({}, msg, { _id: id });
+
       const timer = setTimeout(() => {
-        delete pending[id];
-        try { sock && sock.destroy(); } catch (e) {}
-        sock = null;
-        if (tryNo < SEND_RETRIES) return attempt(tryNo + 1);
-        if (MUTATING_CMDS.has(msg.cmd)) {
-          resolve({ error: "timeout waiting for page response (retried " + SEND_RETRIES + "x). The action may still have executed — verify page state (toast, cart, DOM) before retrying.", mayHaveExecuted: true });
-          return;
-        }
-        reject(new Error("timeout"));
-      }, window);
-      const m = { ...msg, _id: id };
-      pending[id] = (resp) => {
-        clearTimeout(timer);
-        if (resp === null) {
-          // Socket died before the reply arrived — retry on a fresh one.
-          sock = null;
-          if (tryNo < SEND_RETRIES) return attempt(tryNo + 1);
-          if (MUTATING_CMDS.has(msg.cmd)) {
-            resolve({ error: "connection lost (retried " + SEND_RETRIES + "x). The action may still have executed — verify page state before retrying.", mayHaveExecuted: true });
+        pending.delete(id);
+        reject(new Error("Timed out after " + timeoutMs + "ms waiting for browser response"));
+      }, timeoutMs);
+
+      pending.set(id, {
+        timer,
+        resolve: resp => {
+          delete resp._id;
+          if (resp && resp.text === "" && resp.tabId === undefined && msg.cmd !== "read") {
+            reject(new Error("Legacy browser-bridge v1.x addon responded; reload/install the v2.0 addon in Firefox"));
             return;
           }
-          reject(new Error("connection lost"));
+          resolve(resp);
+        },
+        onSocketClose: reason => {
+          // Only reconnect-retry if we wrote to a pre-existing idle socket that broke immediately (<250ms).
+          if (allowReconnectRetry && wasAlreadyOpen && Date.now() - sentAt < 250) {
+            attempt(false);
+            return;
+          }
+          reject(new Error(reason));
+        }
+      });
+
+      try {
+        sock.write(JSON.stringify(wireMsg) + "\n");
+      } catch (err) {
+        clearTimeout(timer);
+        pending.delete(id);
+        try { sock && sock.destroy(); } catch (_) {}
+        sock = null;
+        sockConnected = false;
+        if (allowReconnectRetry) {
+          attempt(false);
           return;
         }
-        resolve(resp);
-      };
-      try { sock.write(JSON.stringify(m) + "\n"); } catch (e) { clearTimeout(timer); delete pending[id]; sock = null; if (tryNo < SEND_RETRIES) return attempt(tryNo + 1); if (MUTATING_CMDS.has(msg.cmd)) { resolve({ error: "connection error (retried " + SEND_RETRIES + "x). The action may still have executed — verify page state before retrying.", mayHaveExecuted: true }); return; } reject(e); }
+        reject(err);
+      }
     };
-    attempt(0);
+
+    attempt(true);
   });
+}
+
+function saveScreenshotToDisk(resp) {
+  if (!resp || !resp.dataUrl) return resp;
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.+)$/i.exec(resp.dataUrl);
+  if (!match) {
+    throw new Error("Unexpected screenshot dataUrl format");
+  }
+  const mimeType = match[1];
+  const ext = mimeType === "image/png" ? "png" : "jpg";
+  const bytes = Buffer.from(match[2], "base64");
+
+  fs.mkdirSync(SCREENSHOT_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(SCREENSHOT_DIR, 0o700); } catch (_) {}
+
+  const fileName = `shot-${Date.now()}-tab${resp.tabId || 0}.${ext}`;
+  const filePath = path.join(SCREENSHOT_DIR, fileName);
+  fs.writeFileSync(filePath, bytes, { mode: 0o600 });
+
+  // Prune old screenshots so /tmp stays bounded.
+  try {
+    const entries = fs.readdirSync(SCREENSHOT_DIR)
+      .filter(f => f.startsWith("shot-"))
+      .map(f => {
+        const full = path.join(SCREENSHOT_DIR, f);
+        return { full, mtimeMs: fs.statSync(full).mtimeMs };
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const old of entries.slice(MAX_SCREENSHOT_FILES)) {
+      try { fs.unlinkSync(old.full); } catch (_) {}
+    }
+  } catch (_) {}
+
+  const out = Object.assign({}, resp);
+  delete out.dataUrl;
+  out.filePath = filePath;
+  out.mimeType = mimeType;
+  out.bytes = bytes.length;
+  return out;
 }
 
 const TOOLS = [
   {
-    name: "browser_read",
-    description: "Read text content of the active browser tab. Returns all visible and hidden text nodes. Optional selector: only read that element's subtree. Optional visibleOnly: skip text inside display:none/visibility:hidden subtrees. Optional maxChars: truncate output (response includes truncated:true and totalChars so you can re-read with a larger cap).",
-    inputSchema: { type: "object", properties: { selector: { type: "string", description: "Optional CSS/#id/[attr], text=..., or :has-text('...') selector to scope the read" }, visibleOnly: { type: "boolean", description: "Skip text inside hidden (display:none / visibility:hidden) subtrees" }, maxChars: { type: "number", description: "Truncate output to N chars; response reports truncated + totalChars" } } }
-  },
-  {
-    name: "browser_html",
-    description: "Get full HTML of the active browser tab. Optional maxChars: truncate output (response includes truncated:true and totalChars so you can re-read with a larger cap).",
-    inputSchema: { type: "object", properties: { maxChars: { type: "number", description: "Truncate output to N chars; response reports truncated + totalChars" } } }
-  },
-  {
-    name: "browser_js",
-    description: "Execute arbitrary JavaScript on the active browser tab and return the result.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        code: { type: "string", description: "JavaScript code to execute. Use (() => { ... })() for async." }
-      },
-      required: ["code"]
-    }
-  },
-  {
-    name: "browser_click",
-    description: "Click an element on the active tab. selector can be a CSS selector, #id, [name=value], text=Label, role=button, label=Field, or :has-text('X')/:contains('X') (translated to substring text match). Unquoted attribute values like [data-page=2] are auto-quoted. Clicking an <option> selects it on the parent <select> (fires change) since plain clicks don't. If multiple elements match, the call ERRORS with a numbered matched list — append |index=N to pick one (index is 0-based, e.g. '.variant|index=1' = 2nd match). A resolved index is NOT reported as ambiguous. Timeouts are non-fatal: the click may have landed — verify page state first.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        selector: { type: "string", description: "CSS selector, #id, [name=value], text=..., role=..., label=..., or :has-text('...') for the element to click. Append |index=N (0-based) when the selector matches multiple elements." }
-      },
-      required: ["selector"]
-    }
-  },
-  {
-    name: "browser_type",
-    description: "Type text into an input or textarea on the active tab. selector can be a CSS selector, #id, [name=value], text=Label, role=button, label=Field, or :has-text('X'). Set pressEnter:true to dispatch Enter and submit the enclosing form; when there is no form (e.g. a search box with a sibling button), the sibling submit/search button is clicked instead. Returns 'landed' to confirm the value actually registered (false if the framework ignored the direct assignment). Ambiguous selectors error with a numbered list — append |index=N (0-based) to pick one.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        selector: { type: "string", description: "CSS selector, #id, [name=value], text=..., role=..., label=..., or :has-text('...') for the target element. Append |index=N when the selector matches multiple elements." },
-        value: { type: "string", description: "Text to type into the element" },
-        pressEnter: { type: "boolean", description: "Dispatch Enter key and submit the enclosing form" }
-      },
-      required: ["selector", "value"]
-    }
-  },
-  {
-    name: "browser_act",
-    description: "Compound action: click or type, optionally wait for a selector, then return post-state (toast text, cart count, matched elements) in ONE call. Use this instead of separate click+toast round trips. Actions: 'click' (selector), 'type' (selector+value, optional pressEnter), 'wait' (selector+timeout). Clicking an <option> selects it on the parent <select> (fires change). Optional verify: a selector whose text is returned after the action. Ambiguous selectors error with a numbered list — append |index=N (0-based) to pick one. Timeouts are non-fatal: the action may have landed — check post-state.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        action: { type: "string", description: "'click', 'type', or 'wait'" },
-        selector: { type: "string", description: "Target selector (text=..., role=..., label=..., CSS, #id). Append |index=N when the selector matches multiple elements." },
-        value: { type: "string", description: "For action=type: text to type" },
-        pressEnter: { type: "boolean", description: "For action=type: dispatch Enter + submit form" },
-        timeout: { type: "number", description: "For action=wait: max ms to wait (default 5000)" },
-        verify: { type: "string", description: "Optional selector whose text is returned after the action (e.g. '#toast')" }
-      },
-      required: ["action", "selector"]
-    }
-  },
-  {
-    name: "browser_wait",
-    description: "Wait until a selector exists and is visible, up to timeout ms. Use for late-injected elements (e.g. a button that appears ~1.5s after load).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        selector: { type: "string", description: "Selector to wait for (text=..., role=..., label=..., CSS, #id)" },
-        timeout: { type: "number", description: "Max ms to wait (default 5000)" }
-      },
-      required: ["selector"]
-    }
-  },
-  {
-    name: "browser_toast",
-    description: "Read toast/notification text from the page. If the toast element still shows text, returns it (with '(N s ago)' age); if it already faded, returns the newest toast seen since your last read marked '(faded)', so a toast that appeared and expired between calls is still reported instead of null. Returns null only when no toast has ever appeared (or page was reloaded). Use browser_act with verify to capture a toast in the same call as the action.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_dialog",
-    description: "Handle native alert()/confirm()/prompt() dialogs. These are browser chrome, not DOM, so they can't be clicked — the addon intercepts them in the page and queues them. IMPORTANT: confirm()/prompt() return synchronously, so you must ARM the answer BEFORE triggering the dialog. Actions: 'list' (default) returns dialogs that have fired [{type, message, defaultValue}]; 'answer' arms a response for the next matching dialog — pass type:'confirm' with accept:true/false (default true), or type:'prompt' with value (default ''), or type:'alert' (fire-and-forget, auto-dismissed); 'clear' drops all queued dialogs and armed answers. Workflow: browser_dialog answer (arm) → trigger the action that pops the dialog → browser_dialog list to confirm it fired.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        action: { type: "string", description: "'list' (default), 'answer', or 'clear'" },
-        type: { type: "string", description: "For answer: 'alert', 'confirm', or 'prompt' — the dialog type to arm a response for" },
-        accept: { type: "boolean", description: "For answer type=confirm: true to accept (OK), false to dismiss (Cancel). Default true." },
-        value: { type: "string", description: "For answer type=prompt: the text to submit. Default ''." }
-      }
-    }
-  },
-  {
-    name: "browser_clear_storage",
-    description: "Clear localStorage and sessionStorage of the active tab. Use to reset page state (cart, session, evidence) before a fresh task run.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_security",
-    description: "Extract security-relevant data from the active tab: forms, scripts, cookies, storage, external domains, meta tags, CSP meta, inline scripts, iframes. Use to audit a page for web vulnerabilities.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_navigate",
-    description: "Navigate to a URL. Opens in a new tab by default, or reuse the current tab if newTab is false.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        url: { type: "string", description: "URL to navigate to" },
-        newTab: { type: "boolean", description: "Open in new tab (default true). Set false to reuse current tab." }
-      },
-      required: ["url"]
-    }
-  },
-  {
-    name: "browser_console",
-    description: "Capture console.log/error/warn/info/debug output from the page. Returns logs collected since page load (up to 500).",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_network",
-    description: "Capture ALL network requests from the active tab (page load + fetch/XHR). Returns up to 500 requests with URL, method, type, timestamp.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
     name: "browser_tabs",
-    description: "List all open tabs, switch to a specific tab by index, or close a tab. Actions: 'list', 'switch' (tabId), 'close' (tabId).",
+    description: "List, filter, switch, or close browser tabs. Pass 'query' when listing to filter by title/URL substring (or '/regex/') instead of dumping 90+ tabs. All tools accept 'tabId' directly and execute in the background without stealing user focus, so you rarely need 'switch'.",
     inputSchema: {
       type: "object",
       properties: {
-        action: { type: "string", description: "'list', 'switch', or 'close'" },
-        tabId: { type: "number", description: "Tab index (0-based) to switch/close. Required when action is 'switch' or 'close'." }
+        action: { type: "string", enum: ["list", "switch", "close"], description: "'list' (default), 'switch', or 'close'" },
+        query: { type: "string", description: "For 'list': case-insensitive substring or '/regex/' matching tab title or URL" },
+        activeOnly: { type: "boolean", description: "For 'list': only return active tabs across windows" },
+        tabId: { type: "number", description: "Exact integer tabId (from 'list') for 'switch' or 'close'" },
+        focusWindow: { type: "boolean", description: "For 'switch': also bring the browser window to OS foreground (default false)" }
       },
       required: ["action"]
     }
   },
   {
-    name: "browser_postmessage",
-    description: "Capture all window.postMessage events between frames. Returns origin, data, source (self/iframe), timestamp. Useful for finding postMessage-based XSS or origin validation bugs.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_dom_sinks",
-    description: "Find DOM XSS sinks in inline scripts: innerHTML, document.write, eval, setTimeout(string), jQuery.html(), dangerouslySetInnerHTML, location.href, and more. Returns sink type, count, and code snippet.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_storage",
-    description: "Dump cookies (full values), localStorage, and sessionStorage from the active tab. Use to find sensitive data stored client-side.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_csp",
-    description: "Extract Content-Security-Policy from meta tags and flag weaknesses: unsafe-inline, unsafe-eval, wildcards, missing directives (frame-ancestors, object-src, base-uri, form-action).",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_cors",
-    description: "Find cross-origin resources (scripts, styles, images with crossorigin attribute) and list external origins. Use to identify potential CORS misconfiguration targets.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_websocket",
-    description: "Capture WebSocket connections and messages (connect, send, recv) from the active tab. Returns URL, direction, data, timestamp.",
-    inputSchema: { type: "object", properties: {} }
-  },
-  {
-    name: "browser_strip_headers",
-    description: "Toggle stripping of security headers (CSP, X-XSS-Protection, X-Frame-Options, X-Content-Type-Options) for testing. Pass active:true to enable, active:false to disable.",
+    name: "browser_js",
+    description: "Execute JavaScript in a tab (defaults to MAIN world with automatic CSP fallback to ISOLATED world) and return the serialized result. Pass explicit 'tabId' so execution runs silently in the background tab without stealing focus. Never auto-retried on timeout.",
     inputSchema: {
       type: "object",
       properties: {
-        active: { type: "boolean", description: "true to strip headers, false to restore" }
+        code: { type: "string", description: "JS expression, IIFE, or async IIFE '(() => { ... })()' to evaluate" },
+        tabId: { type: "number", description: "Target tabId from browser_tabs (recommended; omits focus switch). Defaults to active tab if omitted." },
+        timeoutMs: { type: "number", description: "Execution timeout in ms (default 15000, max 120000 for batch fetch)" },
+        world: { type: "string", enum: ["auto", "MAIN", "ISOLATED"], description: "Execution world: 'auto' (default, MAIN with CSP fallback), 'MAIN', or 'ISOLATED'" },
+        frameId: { type: "number", description: "Target frameId (default 0 for top-level document)" }
       },
-      required: ["active"]
+      required: ["code"]
     }
   },
   {
-    name: "browser_upload",
-    description: "Upload a local file to a file input on the active tab. Reads the file from disk on the host, base64-encodes it, and sets it on the target <input type=file> (fires change). selector can be a CSS selector, #id, [name=value], or :has-text('...'). Returns the file name, size, and whether the input accepted it. Use when a page needs a real file (CV upload, resume, etc.).",
+    name: "browser_read",
+    description: "Extract readable text from a tab (on-demand, zero background footprint). Supports scoping to a CSS selector and skipping hidden elements.",
     inputSchema: {
       type: "object",
       properties: {
-        selector: { type: "string", description: "CSS selector, #id, [name=value], or :has-text('...') for the <input type=file> element. Append |index=N when the selector matches multiple elements." },
-        filePath: { type: "string", description: "Absolute path to the local file to upload" }
-      },
-      required: ["selector", "filePath"]
+        tabId: { type: "number", description: "Target tabId from browser_tabs (runs in background without switching focus)" },
+        selector: { type: "string", description: "Optional CSS selector to scope text extraction" },
+        visibleOnly: { type: "boolean", description: "Skip display:none / visibility:hidden subtrees (default true)" },
+        maxChars: { type: "number", description: "Truncate output to N chars (default 20000)" }
+      }
     }
   },
   {
-    name: "browser_event_listeners",
-    description: "Enumerate inline event handlers (onclick, onsubmit, onchange, etc.) and interactive elements (forms, buttons, links, inputs) on the page. Use to find client-side attack surface.",
-    inputSchema: { type: "object", properties: {} }
+    name: "browser_html",
+    description: "Get outerHTML of the full document or a specific CSS selector from a tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId from browser_tabs" },
+        selector: { type: "string", description: "Optional CSS selector to read only that subtree's outerHTML" },
+        maxChars: { type: "number", description: "Truncate output to N chars (default 30000)" }
+      }
+    }
+  },
+  {
+    name: "browser_navigate",
+    description: "Open a URL in a background/foreground tab, navigate an existing tabId, or reload a tabId. Opens in background by default (active=false) to avoid interrupting the user.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL to open or navigate to (omit when reload=true)" },
+        tabId: { type: "number", description: "Existing tabId to navigate or reload" },
+        newTab: { type: "boolean", description: "Open in a new tab (default true when tabId is omitted)" },
+        active: { type: "boolean", description: "Focus the tab in foreground (default false)" },
+        reload: { type: "boolean", description: "Reload target tabId" },
+        bypassCache: { type: "boolean", description: "Bypass browser cache when reloading" }
+      }
+    }
+  },
+  {
+    name: "browser_screenshot",
+    description: "Capture a crisp screenshot of a tab (works on background tabs too via Firefox captureTab) and save to a local file. Defaults to WebRender native scale=1 (1:1 CSS pixel density — 75% fewer pixels than 2x 4K HiDPI while keeping 12px CJK text sharp) and lossless PNG.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId (can capture background tabs without switching focus)" },
+        scale: { type: "number", description: "Device pixels per CSS pixel passed directly to WebRender (default 1 = 1x CSS resolution; pass 2 for native 4K Retina)" },
+        maxWidth: { type: "number", description: "Optional max output width cap in px (default 0 = use exact scale without fractional resampling)" },
+        format: { type: "string", enum: ["png", "jpeg"], description: "Output image format (default 'png' for crisp text; use 'jpeg' for photo-heavy pages)" },
+        quality: { type: "number", description: "JPEG quality 1-100 when format='jpeg' (default 90)" },
+        selector: { type: "string", description: "Optional CSS selector to crop screenshot to that element" }
+      }
+    }
+  },
+  {
+    name: "browser_pick",
+    description: "Launch an interactive visual element picker in the tab so the user can click element(s) (Cmd/Ctrl+Click for multi-select, Enter to finish, Esc to cancel). Returns unique CSS selector, bounding rect, text, and HTML snippet.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message: { type: "string", description: "Prompt banner shown to the user (e.g. 'Click the target button')" },
+        tabId: { type: "number", description: "Target tabId (automatically focused so the user can click)" },
+        timeoutMs: { type: "number", description: "Max wait time for user selection in ms (default 120000)" }
+      },
+      required: ["message"]
+    }
+  },
+  {
+    name: "browser_diagnostics",
+    description: "Zero-idle-cost network & console diagnostics for a single tab. 'snapshot' (default) instantly reads Performance Resource/Navigation entries without prior hooks. 'start' attaches per-tab webRequest & console/uncaught-error capture ONLY on that tabId (pass reload=true to capture load-time errors from document_start). 'stop' detaches.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "Target tabId" },
+        action: { type: "string", enum: ["snapshot", "start", "stop"], description: "'snapshot' (default), 'start', or 'stop'" },
+        reload: { type: "boolean", description: "With action='start': reload the tab after attaching hooks to capture page-load errors" },
+        bypassCache: { type: "boolean", description: "With reload=true: bypass cache" },
+        urlFilter: { type: "string", description: "Optional case-insensitive substring to filter network URLs" }
+      }
+    }
   }
 ];
-
-// Queue tools: repeated identical reads return the same (or empty) state, so
-// a model stuck re-calling one gets no new information. Track the last call
-// per tool; an identical repeat within the window is rejected with guidance
-// instead of silently returning null forever (loop guard).
-const QUEUE_TOOLS = new Set(["browser_toast", "browser_console", "browser_network", "browser_postmessage", "browser_websocket"]);
-const REPEAT_WINDOW_MS = 5000;
-let lastCall = null;
 
 let stdinBuf = "";
 process.stdin.on("data", chunk => {
@@ -306,112 +281,152 @@ process.stdin.on("data", chunk => {
   while ((newline = stdinBuf.indexOf("\n")) !== -1) {
     const line = stdinBuf.slice(0, newline);
     stdinBuf = stdinBuf.slice(newline + 1);
-    handle(line);
+    if (line.trim()) handle(line);
   }
 });
 
-async function handle(line) {
-  try {
-    const req = JSON.parse(line);
-    const { id, method, params } = req;
+async function dispatchTool(name, args = {}) {
+  switch (name) {
+    case "browser_tabs":
+      return send({
+        cmd: "tabs",
+        action: args.action || "list",
+        query: args.query,
+        activeOnly: args.activeOnly,
+        tabId: args.tabId,
+        focusWindow: args.focusWindow
+      }, 10000);
 
-    if (method === "initialize") {
-      respond(id, { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "browser-bridge", version: "1.2" } });
-    } else if (method === "tools/list") {
-      respond(id, { tools: TOOLS });
-    } else if (method === "tools/call") {
-      const { name, arguments: args } = params;
-      try {
-        let result;
-        if (QUEUE_TOOLS.has(name)) {
-          const now = Date.now();
-          const same = lastCall && lastCall.name === name && JSON.stringify(lastCall.args) === JSON.stringify(args);
-          if (same && now - lastCall.ts < REPEAT_WINDOW_MS) {
-            respond(id, { content: [{ type: "text", text: JSON.stringify({ error: "identical " + name + " call repeated within " + REPEAT_WINDOW_MS + "ms — a queue read returns no new state. Do something else first (click, navigate, js) or read the DOM instead." }) }], isError: true });
-            return;
-          }
-          lastCall = { name, args, ts: now };
-        }
-        if (name === "browser_read") {
-          result = await send({ cmd: "read", selector: args.selector, visibleOnly: args.visibleOnly, maxChars: args.maxChars });
-        } else if (name === "browser_click") {
-          result = await send({ cmd: "click", selector: args.selector });
-        } else if (name === "browser_type") {
-          result = await send({ cmd: "type", selector: args.selector, value: args.value, pressEnter: args.pressEnter });
-        } else if (name === "browser_act") {
-          result = await send({ cmd: "act", action: args.action, selector: args.selector, value: args.value, pressEnter: args.pressEnter, timeout: args.timeout, verify: args.verify });
-        } else if (name === "browser_wait") {
-          result = await send({ cmd: "wait", selector: args.selector, timeout: args.timeout });
-        } else if (name === "browser_toast") {
-          result = await send({ cmd: "toast" });
-        } else if (name === "browser_dialog") {
-          result = await send({ cmd: "dialog", action: args.action || "list", accept: args.accept, value: args.value });
-        } else if (name === "browser_clear_storage") {
-          result = await send({ cmd: "clear_storage" });
-        } else if (name === "browser_html") {
-          result = await send({ cmd: "html", maxChars: args.maxChars });
-        } else if (name === "browser_js") {
-          result = await send({ cmd: "js", code: args.code });
-        } else if (name === "browser_security") {
-          result = await send({ cmd: "security" });
-        } else if (name === "browser_navigate") {
-          result = await send({ cmd: "navigate", url: args.url, newTab: args.newTab !== false });
-        } else if (name === "browser_console") {
-          result = await send({ cmd: "console" });
-        } else if (name === "browser_network") {
-          result = await send({ cmd: "network" });
-        } else if (name === "browser_tabs") {
-          result = await send({ cmd: "tabs", action: args.action, tabId: args.tabId });
-        } else if (name === "browser_postmessage") {
-          result = await send({ cmd: "postmessage" });
-        } else if (name === "browser_dom_sinks") {
-          result = await send({ cmd: "dom_sinks" });
-        } else if (name === "browser_storage") {
-          result = await send({ cmd: "storage" });
-        } else if (name === "browser_csp") {
-          result = await send({ cmd: "csp" });
-        } else if (name === "browser_cors") {
-          result = await send({ cmd: "cors" });
-        } else if (name === "browser_websocket") {
-          result = await send({ cmd: "websocket" });
-        } else if (name === "browser_strip_headers") {
-          result = await send({ cmd: "strip_headers", active: args.active });
-        } else if (name === "browser_upload") {
-          const filePath = path.resolve(args.filePath);
-          let stat;
-          try {
-            stat = fs.statSync(filePath);
-          } catch (e) {
-            respond(id, { content: [{ type: "text", text: JSON.stringify({ error: "cannot read file: " + e.message }) }], isError: true });
-            return;
-          }
-          if (!stat.isFile()) {
-            respond(id, { content: [{ type: "text", text: JSON.stringify({ error: "not a file: " + filePath }) }], isError: true });
-            return;
-          }
-          const data = fs.readFileSync(filePath);
-          const base64 = data.toString("base64");
-          const fileName = path.basename(filePath);
-          const mime = fileName.toLowerCase().endsWith(".pdf") ? "application/pdf" : "application/octet-stream";
-          result = await send({ cmd: "upload", selector: args.selector, fileName, mime, base64, size: data.length });
-        } else if (name === "browser_event_listeners") {
-          result = await send({ cmd: "event_listeners" });
-        } else {
-          result = { error: "unknown tool: " + name };
-        }
-        respond(id, { content: [{ type: "text", text: JSON.stringify(result) }] });
-      } catch (e) {
-        respond(id, { content: [{ type: "text", text: JSON.stringify({ error: e.message }) }], isError: true });
-      }
-    } else if (method === "notifications/initialized") {
-    } else {
-      respond(id, { error: { code: -32601, message: `Unknown method: ${method}` } });
+    case "browser_js": {
+      const execTimeout = Math.min(Math.max(Number(args.timeoutMs) || 15000, 500), 120000);
+      return send({
+        cmd: "js",
+        code: args.code,
+        tabId: args.tabId,
+        timeoutMs: execTimeout,
+        world: args.world || "auto",
+        frameId: args.frameId
+      }, execTimeout + 5000);
     }
+
+    case "browser_read":
+      return send({
+        cmd: "read",
+        tabId: args.tabId,
+        selector: args.selector,
+        visibleOnly: args.visibleOnly,
+        maxChars: args.maxChars
+      }, 20000);
+
+    case "browser_html":
+      return send({
+        cmd: "html",
+        tabId: args.tabId,
+        selector: args.selector,
+        maxChars: args.maxChars
+      }, 20000);
+
+    case "browser_navigate":
+      return send({
+        cmd: "navigate",
+        url: args.url,
+        tabId: args.tabId,
+        newTab: args.newTab,
+        active: args.active,
+        reload: args.reload,
+        bypassCache: args.bypassCache
+      }, 25000);
+
+    case "browser_screenshot": {
+      const resp = await send({
+        cmd: "screenshot",
+        tabId: args.tabId,
+        scale: args.scale,
+        maxWidth: args.maxWidth,
+        format: args.format,
+        quality: args.quality,
+        selector: args.selector
+      }, 25000);
+      if (resp && resp.error) return resp;
+      return saveScreenshotToDisk(resp);
+    }
+
+    case "browser_pick": {
+      const pickTimeout = Math.min(Math.max(Number(args.timeoutMs) || 120000, 5000), 300000);
+      return send({
+        cmd: "pick",
+        message: args.message,
+        tabId: args.tabId,
+        timeoutMs: pickTimeout
+      }, pickTimeout + 5000);
+    }
+
+    case "browser_diagnostics":
+      return send({
+        cmd: "diagnostics",
+        tabId: args.tabId,
+        action: args.action || "snapshot",
+        reload: args.reload,
+        bypassCache: args.bypassCache,
+        urlFilter: args.urlFilter
+      }, args.reload ? 25000 : 15000);
+
+    default:
+      throw new Error("Unknown tool: " + name);
+  }
+}
+
+async function handle(line) {
+  let req;
+  try {
+    req = JSON.parse(line);
   } catch (e) {
-    process.stderr.write("mcp-server error: " + e.message + "\n");
+    process.stderr.write("mcp-server invalid JSON: " + e.message + "\n");
+    return;
+  }
+
+  const { id, method, params } = req;
+  if (method === "initialize") {
+    respond(id, {
+      protocolVersion: "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "browser-bridge", version: "2.0.1" }
+    });
+    return;
+  }
+  if (method === "notifications/initialized") {
+    return;
+  }
+  if (method === "tools/list") {
+    respond(id, { tools: TOOLS });
+    return;
+  }
+  if (method === "tools/call") {
+    const { name, arguments: args } = params || {};
+    try {
+      const result = await dispatchTool(name, args || {});
+      const isErr = Boolean(result && result.error);
+      respond(id, {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        ...(isErr ? { isError: true } : {})
+      });
+    } catch (e) {
+      respond(id, {
+        content: [{ type: "text", text: JSON.stringify({ error: e.message || String(e) }) }],
+        isError: true
+      });
+    }
+    return;
+  }
+  if (id !== undefined) {
+    respondError(id, -32601, "Unknown method: " + method);
   }
 }
 
 function respond(id, result) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n");
+}
+
+function respondError(id, code, message) {
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n");
 }

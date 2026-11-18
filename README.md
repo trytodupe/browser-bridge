@@ -1,210 +1,36 @@
-# browser-bridge
+# browser-bridge (Zero-Footprint On-Demand Edition)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Firefox Add-on](https://img.shields.io/badge/Firefox-Add--on-orange)](https://addons.mozilla.org)
+Lightweight Firefox WebExtension + Native Messaging MCP bridge for coding agents, engineered for **zero idle overhead in a daily-driver browser**.
 
-Bridge opencode into your browser. Read pages, execute JavaScript, and audit for security flaws — all from your terminal. Purpose-built for bug bounty hunting.
+## Key Architecture Differences vs Upstream v1.x
 
-## Why
+- **Zero Static Injection**: No `content_scripts` in `manifest.json`, no global `MutationObserver`, no `webRequestBlocking`, and no overrides on `fetch`, `XMLHttpRequest`, `WebSocket`, or `alert`/`confirm`/`prompt`. Idle tabs pay **0% CPU and 0 bytes** of extension overhead.
+- **Explicit `tabId` Background Execution**: All tools accept Firefox's stable integer `tabId` (`tab.id`), automatically wake `discarded` tabs, and run silently in background tabs without stealing foreground window/tab focus.
+- **Native `MAIN` World JS + Automatic CSP Fallback**: `browser_js` executes directly in the page's `MAIN` world (native access to `window.jQuery`, React Fiber, Vue/Lit state, same-origin `iframe.contentWindow`, and authenticated `fetch`) and automatically falls back to `ISOLATED` world on strict-CSP pages. Never auto-retries on timeout.
+- **4K HiDPI Crisp Screenshots (`browser_screenshot`)**: Uses `browser.tabs.captureTab(tabId, { scale: 1, format: "png" })` by default — rasterizing vectors & CJK text directly in Firefox WebRender at exact `1x` CSS pixel density (75% fewer pixels than `2x` 4K Retina with zero `<canvas>` resampling blur or JPEG ringing), writing owner-only (`0600`) files to `/tmp/browser-bridge-screenshots/`.
+- **Interactive Element Picker (`browser_pick`)**: On-demand visual element selector (`Click`, `Cmd/Ctrl+Click` multi-select, `Enter` confirm, `Esc` cancel) returning unique CSS selectors and bounding boxes.
+- **Opt-In Per-Tab Diagnostics (`browser_diagnostics`)**: Instant `PerformanceResourceTiming` snapshot without prior hooks, or opt-in `{ tabId }`-scoped `webRequest` + console/error capture.
 
-Bug bounty hunters spend half their time switching between browser and tools. browser-bridge puts opencode directly inside the page. Browse normally, then ask opencode to read the DOM, run JS, or scan for vulnerabilities — no proxies, no manual export, no context switching.
+## Tools (8)
 
-## Why not firefox-devtools-mcp
+| Tool | Purpose |
+| :--- | :--- |
+| `browser_tabs` | `list` (with `query` substring/`/regex/` & `activeOnly`), `switch`, `close` |
+| `browser_js` | Execute JS/async IIFE on `tabId` (`timeoutMs` up to `120000`, `world`: `auto`/`MAIN`/`ISOLATED`) |
+| `browser_read` | Extract visible/scoped text from `tabId` on demand |
+| `browser_html` | Extract full or `selector`-scoped `outerHTML` from `tabId` |
+| `browser_navigate` | Open/navigate/reload URLs (defaults to `active: false` background tab) |
+| `browser_screenshot` | Capture full viewport or `selector` crop, default downsampled to `1280px` width |
+| `browser_pick` | Interactive human element picker returning unique CSS selector + metadata |
+| `browser_diagnostics` | `snapshot` (Resource Timing) or `start`/`stop` per-tab network & console capture |
 
-Alternative MCP servers like [Mozilla's firefox-devtools-mcp](https://github.com/mozilla/firefox-devtools-mcp) drive Firefox externally through WebDriver BiDi. That approach works, but it leaves a detectable fingerprint:
-
-- Sets `navigator.webdriver = true` and enables Marionette
-- Alters other browser fingerprint signals
-- Gets blocked by Cloudflare, Akamai, and other bot detection on the very targets you want to test
-
-browser-bridge takes the opposite approach. Instead of driving the browser from outside, it runs **inside** the page as a Firefox addon. No WebDriver flag, no Marionette, no modified fingerprint — sites can't tell you're there. You see the page exactly as a real user does, which means the security findings you get are the ones that actually matter in the wild.
-
-## ZAP integration
-
-browser-bridge works wonderfully alongside [OWASP ZAP](https://www.zaproxy.org/). Run ZAP as your proxy for active/passive scanning, and use browser-bridge to navigate, read responses, and dig into DOM sinks, CORS, and CSP from inside the page. The two complement each other: ZAP finds server-side issues, browser-bridge finds client-side ones — without either tipping off the target.
-
-## Architecture
-
-```
-opencode ──▶ MCP server (stdio) ──▶ Unix socket ──▶ host.js (native messaging) ──▶ browser addon ──▶ page
-```
-
-The MCP server talks to opencode over stdio. It forwards commands through a Unix socket to the native messaging host, which relays them into the browser's active tab. Responses flow back the same way.
-
-## Requirements
-
-- [omp](https://github.com/can1357/oh-my-pi) (primary) or [opencode](https://opencode.ai)
-- [Firefox](https://www.mozilla.org/firefox/)
-- [Node.js](https://nodejs.org) ≥ 18
-
-## Install
-
-One-liner (Linux/macOS, incl. WSL):
+## Install & Sign Unlisted `.xpi`
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jordandubu/browser-bridge/main/install.sh | bash
-```
-
-or from a checkout:
-
-```bash
-git clone https://github.com/jordandubu/browser-bridge
-cd browser-bridge
 ./install.sh
+cp .env.example .env
+# Fill AMO_API_KEY and AMO_API_SECRET from https://addons.mozilla.org/developers/addon/api/key/
+./scripts/sign-xpi.sh
 ```
 
-`install.sh` registers the Firefox native messaging host and wires the MCP server
-into **omp** (`~/.omp/agent/mcp.json`) — and into opencode too if its config
-exists. No manual config editing.
-
-Install the addon from the [Firefox Add-ons store](https://addons.mozilla.org),
-restart omp, and the `browser_*` tools are available (`/mcp list` to confirm).
-
-## Tools
-
-### Page Interaction
-
-| Tool | Description |
-|------|-------------|
-| `browser_read` | Extract all visible text from the active tab |
-| `browser_html` | Get full page HTML |
-| `browser_js` | Run arbitrary JavaScript and return the result |
-| `browser_navigate` | Navigate to a URL (new tab by default, or reuse current tab) |
-| `browser_tabs` | List all open tabs or switch to a specific tab by index |
-| `browser_dialog` | Handle native `alert()`/`confirm()`/`prompt()` dialogs — list pending, answer (accept/dismiss/type), or clear |
-
-### Recon & Monitoring
-
-| Tool | Description |
-|------|-------------|
-| `browser_console` | Capture console.log/error/warn/info/debug output (up to 500 entries) |
-| `browser_network` | Capture ALL network requests (page load + fetch/XHR) with URL, method, type |
-| `browser_websocket` | Capture WebSocket connections and messages (connect, send, recv) |
-| `browser_postmessage` | Capture all window.postMessage events between frames (origin, data, source) |
-
-### Vulnerability Hunting
-
-| Tool | Description |
-|------|-------------|
-| `browser_security` | Collect forms, scripts, cookies, storage, external domains, meta tags, CSP meta, inline scripts, iframes |
-| `browser_dom_sinks` | Find DOM XSS sinks: innerHTML, document.write, eval, jQuery.html(), dangerouslySetInnerHTML, location.href, and more |
-| `browser_storage` | Dump cookies (full values), localStorage, sessionStorage |
-| `browser_csp` | Extract CSP from meta tags, flag weaknesses (unsafe-inline, unsafe-eval, wildcards, missing directives) |
-| `browser_cors` | Find cross-origin resources and external origins for CORS misconfiguration testing |
-| `browser_event_listeners` | Enumerate inline event handlers (onclick, onsubmit, etc.) and interactive elements |
-| `browser_strip_headers` | Toggle stripping of security headers (CSP, X-XSS-Protection, X-Frame-Options, X-Content-Type-Options) for testing |
-
-### Example: security audit
-
-```
-User: audit this page for vulnerabilities
-opencode → browser_security → returns forms, scripts, cookies, external domains
-opencode: "Found 3 issues:
-  1. Login form submits over HTTP (no TLS)
-  2. No CSP meta tag detected
-  3. Inline script uses innerHTML with user-controlled input"
-```
-
-### Example: DOM XSS hunt
-
-```
-User: check for DOM XSS on this page
-opencode → browser_dom_sinks → returns sink list
-opencode: "Found innerHTML usage in 2 inline scripts, eval() in 1 script"
-opencode → browser_postmessage → returns postMessage logs
-opencode: "postMessage listener at line 42 accepts any origin — potential XSS vector"
-```
-
-### Example: CORS audit
-
-```
-User: check CORS on this page
-opencode → browser_cors → returns cross-origin resources
-opencode: "3 cross-origin scripts, 1 cross-origin stylesheet. Test each for misconfigured CORS"
-```
-
-### Example: native dialogs
-
-Native `alert()`/`confirm()`/`prompt()` dialogs are browser chrome, not DOM, so they can't be clicked. The addon intercepts them in the page and queues them instead of blocking. Because `confirm()`/`prompt()` return synchronously, arm the answer **before** triggering the dialog:
-
-```
-User: the admin page will pop a confirm — accept it
-opencode → browser_dialog answer type:confirm accept:true
-opencode → browser_click selector:"Delete all users"
-opencode → browser_dialog list → [{type: "confirm", message: "Delete all users?"}]
-opencode: "confirm accepted, page JS continued"
-```
-
-## CLI
-
-For testing without opencode:
-
-```bash
-node host/bridge.js read              # read page text
-node host/bridge.js html              # get page HTML
-node host/bridge.js js "document.title"  # run JS
-node host/bridge.js security          # extract security data
-node host/bridge.js dom_sinks         # find DOM XSS sinks
-node host/bridge.js storage           # dump cookies + storage
-node host/bridge.js csp               # analyze CSP
-node host/bridge.js cors              # find cross-origin resources
-node host/bridge.js postmessage       # capture postMessage events
-node host/bridge.js websocket         # capture WebSocket messages
-node host/bridge.js event_listeners   # enumerate event handlers
-node host/bridge.js dialog list       # list dialogs that have fired
-node host/bridge.js dialog answer alert  # arm: auto-dismiss the next alert
-node host/bridge.js dialog answer confirm true  # arm: accept the next confirm
-node host/bridge.js dialog answer confirm false # arm: dismiss the next confirm
-node host/bridge.js dialog answer prompt "my input"  # arm: answer the next prompt
-node host/bridge.js dialog clear      # drop all queued dialogs + armed answers
-node host/bridge.js strip_headers true  # strip security headers
-node host/bridge.js strip_headers false # restore headers
-node host/bridge.js navigate "https://example.com"  # navigate
-node host/bridge.js tabs list         # list tabs
-node host/bridge.js tabs switch 2     # switch to tab 2
-```
-
-## Files
-
-| Path | Role |
-|------|------|
-| `addon/` | Browser extension (manifest, background, content scripts) |
-| `host/` | Native messaging host, MCP server, CLI client |
-| `tests/` | Tool test suite + selector logic smoke test |
-| `bench/ui/` | Multi-page shop (Acme Shop) used for UI navigation testing with judge/grade scripts |
-
-## Testing
-
-### Tool tests — `tests/`
-
-```bash
-devbox run test-tools
-```
-
-Runs 16 tests covering all 15 `browser_*` tools against a local test page. Orchestrates HTTP server, extension (temp profile), and host bridge — then tears down on exit. CI-ready.
-
-### UI navigation bench — `bench/ui/`
-
-Multi-page shop (catalog, cart, checkout, account) for exercising the navigation tools against realistic UI (menus, toasts, modals, tabs, pagination, late-injected elements).
-
-```bash
-devbox run bench-ui      # serve the shop on :8765
-devbox run test-ui       # judge: run the shop through the MCP socket and grade each task
-```
-
-`bench/ui/judge.js` verifies the shop's interactions against a running bridge; `bench/ui/grade.js` scores a previously-run AI session from its evidence log. Regenerate the pages after editing shared markup with `node bench/ui/build.js`.
-
-For fast dev iteration:
-
-```bash
-npm run dev          # start extension with temp profile
-npm run reload-host  # restart host bridge
-```
-
-## Contributing
-
-PRs welcome. Only opencode is supported — if you want Cursor, Claude Code, or another MCP client, add it yourself. The bridge is client-agnostic (stdio MCP), so it should just work. Test with `devbox run test-tools` and `npm run lint`.
-
-## License
-
-MIT
+Then uninstall the old store addon (`browser-bridge@localhost`) in Firefox `about:addons` and drag-and-drop `dist/*.xpi` into Firefox (or test immediately via `about:debugging#/runtime/this-firefox` -> **Load Temporary Add-on** -> `addon/manifest.json`).

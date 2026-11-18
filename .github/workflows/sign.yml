@@ -1,58 +1,43 @@
-name: Sign & Submit
+name: Lint, Test & Sign XPI
 
 on:
   push:
     branches: [main]
     paths:
       - addon/**
+      - host/**
+      - tests/**
       - package.json
   workflow_dispatch:
-    inputs:
-      repo:
-        description: "Repo to sign (owner/name); defaults to this repo"
-        default: ""
-      ref:
-        description: "Branch/tag/SHA of the target repo"
-        default: ""
-      path:
-        description: "Subdirectory containing the extension source"
-        default: "addon"
-      build:
-        description: "Run esbuild first (node build.mjs inside path)"
-        default: ""
 
 jobs:
-  sign:
+  build-and-sign:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.repo && 'target' || '.' }}
-    env:
-      TARGET_PATH: ${{ github.event_name == 'workflow_dispatch' && inputs.path || 'addon' }}
     steps:
       - uses: actions/checkout@v4
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.repo) }}
-      - uses: actions/checkout@v4
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.repo }}
+      - uses: actions/setup-node@v4
         with:
-          repository: ${{ inputs.repo }}
-          ref: ${{ inputs.ref }}
-          path: target
-      - name: Build (optional esbuild)
-        if: inputs.build != ''
-        run: npm ci && npm run build
-        working-directory: target/${{ env.TARGET_PATH }}
-      - run: npx web-ext lint --source-dir "$TARGET_PATH"
-      - name: Sign & submit
+          node-version: "22"
+      - name: Run unit tests
+        run: node --test tests/mcp-server.test.js
+      - name: Lint and build unsigned archive
         run: |
-          METADATA=""
-          if [ -f "$TARGET_PATH/amo-metadata.json" ]; then METADATA="--amo-metadata $TARGET_PATH/amo-metadata.json"; fi
-          npx web-ext sign --source-dir "$TARGET_PATH" --channel listed --api-key "$AMO_API_KEY" --api-secret "$AMO_API_SECRET" $METADATA
+          npx --yes web-ext lint --source-dir addon
+          npx --yes web-ext build --source-dir addon --artifacts-dir dist --overwrite-dest
+      - name: Sign unlisted XPI via AMO (when secrets configured)
+        if: env.AMO_API_KEY != '' && env.AMO_API_SECRET != ''
         env:
           AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
           AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+        run: |
+          npx --yes web-ext sign \
+            --channel=unlisted \
+            --source-dir addon \
+            --artifacts-dir dist \
+            --api-key "$AMO_API_KEY" \
+            --api-secret "$AMO_API_SECRET"
       - uses: actions/upload-artifact@v4
         with:
-          name: signed-xpi
-          path: target/${{ env.TARGET_PATH }}/*.xpi
+          name: browser-bridge-dist
+          path: dist/*
           if-no-files-found: error

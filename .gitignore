@@ -1,5 +1,8 @@
 node_modules/
+.DS_Store
 *.xpi
+*.zip
+dist/
 web-ext-artifacts/
 .amo-upload-uuid
 browser_bridge.json

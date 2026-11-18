@@ -1,11 +1,13 @@
 #!/usr/bin/env node
+"use strict";
+
 const net = require("net");
 
 const SOCK = process.env.BRIDGE_SOCK || "/tmp/browser-bridge.sock";
 const sock = net.createConnection(SOCK);
+const reqId = 1;
 
 let buf = "";
-let printed = false;
 sock.on("data", chunk => {
   buf += chunk;
   const lines = buf.split("\n");
@@ -14,46 +16,47 @@ sock.on("data", chunk => {
     if (!line.trim()) continue;
     try {
       const msg = JSON.parse(line);
-      // The host echoes probe replies too; the first real response is the
-      // answer to our command. Print it and exit immediately — the old fixed
-      // 5s setTimeout made every CLI call take 5s even for 5ms responses.
-      if (printed) continue;
-      console.log(JSON.stringify(msg));
-      printed = true;
+      if (msg._probe) continue;
+      if (msg._id !== reqId) continue;
+      delete msg._id;
+      console.log(JSON.stringify(msg, null, 2));
       sock.destroy();
-      process.exit(0);
-    } catch (e) {}
+      process.exit(msg.error ? 1 : 0);
+    } catch (_) {}
   }
 });
 
-const cmd = process.argv[2] || "read";
-const arg1 = process.argv[3] || "";
-const arg2 = process.argv[4] || "";
-const arg3 = process.argv[5] || "";
+sock.on("error", err => {
+  console.error("bridge socket error:", err.message);
+  process.exit(1);
+});
 
-const msg = { cmd };
+const cmd = process.argv[2] || "tabs";
+const arg1 = process.argv[3];
+const arg2 = process.argv[4];
 
-if (cmd === "js") {
-  msg.code = arg1;
+const msg = { _id: reqId, cmd };
+
+if (cmd === "tabs") {
+  msg.action = arg1 || "list";
+  if (msg.action === "list" && arg2) msg.query = arg2;
+  else if (arg2) msg.tabId = Number(arg2);
+} else if (cmd === "js") {
+  msg.code = arg1 || "document.title";
+  if (arg2) msg.tabId = Number(arg2);
+} else if (cmd === "read" || cmd === "html" || cmd === "screenshot" || cmd === "diagnostics") {
+  if (arg1) msg.tabId = Number(arg1);
 } else if (cmd === "navigate") {
   msg.url = arg1;
-  msg.newTab = arg2 !== "false";
-} else if (cmd === "tabs") {
-  msg.action = arg1 || "list";
-  msg.tabId = parseInt(arg2) || 0;
-} else if (cmd === "strip_headers") {
-  msg.active = arg1 === "true";
-} else if (cmd === "dialog") {
-  msg.action = arg1 || "list";
-  if (msg.action === "answer") {
-    msg.type = arg2 || "alert";
-    if (arg3 === "true" || arg3 === "false") msg.accept = arg3 === "true";
-    else if (arg3) msg.value = arg3;
-  }
+  if (arg2) msg.tabId = Number(arg2);
+} else if (cmd === "pick") {
+  msg.message = arg1 || "Click an element";
+  if (arg2) msg.tabId = Number(arg2);
 }
 
 sock.write(JSON.stringify(msg) + "\n");
-
-// Backstop only: a response normally arrives in milliseconds and the data
-// handler exits. navigate waits for page load inside the addon, so allow it.
-setTimeout(() => { sock.end(); process.exit(0); }, cmd === "navigate" ? 30000 : 10000);
+setTimeout(() => {
+  console.error("bridge timed out");
+  sock.destroy();
+  process.exit(1);
+}, cmd === "pick" ? 130000 : 30000);

@@ -101,7 +101,7 @@ function takeOwnership() {
     process.exit(1);
   });
   server.listen(SOCK, () => {
-    fs.chmodSync(SOCK, 0o666);
+    fs.chmodSync(SOCK, 0o600);
   });
 }
 
